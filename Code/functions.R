@@ -13,7 +13,8 @@ computeDimL <- function(n){
 }
 
 createDiagMat <- function(x){
-  diag(softplus(x), nrow = length(x))
+  diag(x, nrow = length(x))
+  # diag(softplus(x), nrow = length(x))
 }
 
 extractDiagElement <- function(numCov,
@@ -49,9 +50,22 @@ extractDiagElement <- function(numCov,
   
 }
 
+computeELBOsimple_r <- function(model_mean, L, eps_beta, sigma){
+  
+  z <- sapply(1:n_latent, function(l){
+    
+    model_mean + L %*% eps_beta[l,]
+    
+  })
+  
+  list_lossval_stan <- computeELBOsimple(y, X, sigma, z, model_mean, L %*% t(L))
+  list_lossval_stan$loglik - list_lossval_stan$entropy
+  
+}
+
 createSparseMat <- function(x, idx_blocks_start, idx_blocks_end){
   
-  L <- matrix(0, numCov, numCov)
+  TT <- matrix(0, numCov, numCov)
   
   numBlocks <- length(idx_blocks_start)
   
@@ -60,15 +74,35 @@ createSparseMat <- function(x, idx_blocks_start, idx_blocks_end){
   for (k in 1:numBlocks) {
     numCovBlock <- idx_blocks_end[k] - idx_blocks_start[k] + 1
     for (i in 1:numCovBlock) {
-      L[l1 + i,l1 + 1:i] <- x[l2 + 1:i]
+      TT[l1 + i,l1 + 1:i] <- x[l2 + 1:i]
       l2 <- l2 + i
     }
     l1 <- l1 + numCovBlock
   }
   
-  diag(L) <- softplus(diag(L))
+  diag(TT) <- diag(TT) * diag(TT)
   
-  L
+  TT
+}
+
+createNonZeroElem <- function(idx_blocks_start, idx_blocks_end){
+  
+  TT <- matrix(0, numCov, numCov)
+  
+  numBlocks <- length(idx_blocks_start)
+  
+  l1 <- 0
+  l2 <- 0
+  for (k in 1:numBlocks) {
+    numCovBlock <- idx_blocks_end[k] - idx_blocks_start[k] + 1
+    for (i in 1:numCovBlock) {
+      TT[l1 + i,l1 + 1:i] <- 1
+      l2 <- l2 + i
+    }
+    l1 <- l1 + numCovBlock
+  }
+  
+  TT
 }
 
 createCholMat <- function(x, numCov){
@@ -83,11 +117,10 @@ createCholMat <- function(x, numCov){
     l <- l + i
   }
   
-  diag(L) <- softplus(diag(L))
+  # diag(L) <- softplus(diag(L))
   
   L
 }
-
 
 buildGrid <- function(XY_sp, gridStep){
   
@@ -129,29 +162,351 @@ buildGrid <- function(XY_sp, gridStep){
   allPoints
 }
 
-# OUTPUT ----
+simulateData <- function(n, M, 
+                         ncov_psi, ncov_theta, 
+                         meanPsi, meanTheta){
+  
+  N <- sum(M)
+  
+  beta_psi_true <- c(meanPsi, sample(c(-1,1), ncov_psi, replace = T))
+  beta_theta_true <- c(meanTheta, sample(c(-1,1), ncov_theta, replace = T))
+  
+  X_psi <- matrix(rnorm(n * ncov_psi), n, ncov_psi)
+  X_psi <- cbind(1, X_psi)
+  X_theta <- matrix(rnorm(N * ncov_theta), N, ncov_theta)
+  X_theta <- cbind(1, X_theta)
+  
+  psi <- logistic(X_psi %*% beta_psi_true)
+  theta <- logistic(X_theta %*% beta_theta_true)
+  
+  z <- sapply(1:n, function(i){
+    rbinom(1, 1, psi[i])
+  })
+  
+  y <- rep(0, N)
+  for (i in 1:n) {
+    for (m in 1:M[i]) {
+      if(z[i] == 1){
+        y[sum(M[seq_len(i-1)]) + m] <- 
+          rbinom(1, 1, theta[sum(M[seq_len(i-1)]) + m])
+      } 
+    }
+  }
+  
+  data <- list("X_psi" = X_psi,
+               "X_theta" = X_theta,
+               "y" = y)
+  
+  trueParams <- list(
+    "beta_psi" = beta_psi_true,
+    "beta_theta" = beta_theta_true)  
+  
+  list("trueParams" = trueParams,
+       "data" = data)
+}
 
-simulateFromModel <- function(model_mean, model_cov, 
-                              useDiag, useSparse, idx_covs_flipped, 
+fitModelSparse <- function(y, M, sumM, occ, X_psi, X_p, 
+                     useDiag, useSparse,
+                     epochs, n_latent, 
+                     verbose = F,
+                     model_mean_start = NULL, TT_start = NULL){
+  
+  ncov_psi <- ncol(X_psi)
+  ncov_p <- ncol(X_p)
+  
+  # blocks
+  {
+    # idx_covs <- 1:(ncov_psi + ncov_p)
+    idx_covs <- c(1,ncov_psi + 1,2:ncov_psi,ncov_psi + 2:ncov_p)
+    idx_covs_flipped <- order(idx_covs)
+    
+    idx_blocks_start <- c(1,3:length(idx_covs))
+    idx_blocks_end <- c(2,3:length(idx_covs))
+    # idx_blocks_start <- 1:length(idx_covs)
+    # idx_blocks_end <- 1:length(idx_covs)
+    
+    nonZeroElems <- createNonZeroElem(idx_blocks_start, idx_blocks_end)
+    
+  }
+  
+  # dim L
+  {
+    # numCov <- ncov_psi + ncov_p
+    # if(useDiag){
+    #   dimT <- numCov 
+    # } else if(useSparse) {
+    #   dimT <- sum(
+    #     sapply(seq_along(idx_blocks_start), function(i) {
+    #       computeDimL(idx_blocks_end[i] - idx_blocks_start[i] + 1)    
+    #     })
+    #   )
+    # } else {
+    #   dimT <- numCov * (numCov + 1) / 2
+    # }  
+  }
+  
+  # starting point 
+  {
+    if(is.null(model_mean_start)){
+      model_mean <- rep(0, numCov)  
+    } else {
+      model_mean <- model_mean_start
+    }
+    
+    if(is.null(TT_start)){
+      TT <- diag(1 / (.5), nrow = numCov)
+    } else {
+      TT <- TT_start
+    }
+    
+  }
+  
+  # adadelta
+  {
+    rho <- .95
+    eps <- 10^(-6)
+    egmu <- edeltamu <- rep(0, numCov)
+    egT <- edeltaT <- matrix(0, numCov, numCov)
+    
+    eta_mu <- 10
+    eta_T <- 10
+    
+    # normal algo
+    rho_t_mu <- .01
+    rho_t_T <- .01
+  }
+  
+  loss_values <- rep(NA, epochs)
+  loss_values1 <- rep(NA, epochs)
+  loss_values2 <- rep(NA, epochs)
+  model_mean_output <- matrix(NA, numCov, epochs)
+  TT_output <- array(NA, dim = c(numCov, numCov, epochs))
+  model_sigma_output <- matrix(NA, numCov * numCov, epochs)
+  model_diag_output <- matrix(NA, numCov, epochs)
+  
+  for (i in 1:epochs) {
+    
+    if(verbose){
+      print(paste0("Epoch = ",i))  
+    }
+    
+    {
+      eps_beta <- matrix(rnorm(n_latent * numCov), n_latent, numCov)
+      # eps_beta <- matrix(rnorm(n_latent / 2 * numCov), n_latent / 2, numCov)
+      # eps_beta <- rbind(eps_beta, - eps_beta)
+    }
+    
+    # create L matrix
+    {
+      # if(useDiag){
+      #   TT <- createDiagMat(model_cov)
+      # } else if(useSparse) {
+      #   TT <- createSparseMat(model_cov, idx_blocks_start, idx_blocks_end)
+      # } else {
+      #   TT <- createCholMat(model_cov, numCov)
+      # }
+      
+      tTm1 <- t(solve(TT))
+    }
+    
+    # create latent variables
+    {
+      
+      z_flipped <- sapply(1:n_latent, function(l){
+        
+        model_mean + tTm1 %*% eps_beta[l,]
+        
+      })
+      
+      z <- z_flipped[idx_covs_flipped,,drop=F]
+      
+      beta_psi_flipped <- z_flipped[1:ncov_psi,,drop=F]
+      beta_p_flipped <- z_flipped[ncov_psi + 1:ncov_p,,drop=F]
+      
+      beta_psi <- z[1:ncov_psi,,drop=F]
+      beta_p <- z[ncov_psi + 1:ncov_p,,drop=F]
+      
+      logit_psi <-  X_psi %*% beta_psi
+      logit_p <-  X_p %*% beta_p
+      
+    }
+    
+    # loglikelihood contribution
+    deltaldeltabeta <- computedeltaldeltabeta(y, 
+                                              M, 
+                                              eps_beta, 
+                                              sumM, occ, 
+                                              logit_psi, logit_p, 
+                                              beta_psi, beta_p, 
+                                              X_psi, X_p, 
+                                              idx_covs - 1, idx_blocks_start - 1, 
+                                              idx_blocks_end - 1, 
+                                              n_latent)
+    
+    
+    
+    # prior
+    # time covariates
+    # deltaldeltamu[1 + 1:Y] <- deltaldeltamu[1 + 1:Y] - 
+    # model_mean[1 + 1:Y] %*% invSigma_gp
+    
+    # standard  covariates
+    # deltaldeltamu[-c(1 + 1:Y)] <- deltaldeltamu[-c(1 + 1:Y)] - 
+    #   model_mean[-c(1 + 1:Y)]
+    
+    # deltaldeltamu <- deltaldeltamu - model_mean
+    
+    # normal algo 
+    if(F){
+      gmu <- deltaldeltabeta + t(TT %*% t(eps_beta))
+      
+      gT <- lapply(1:n_latent, function(n_lat){
+        - tTm1 %*% eps_beta[n_lat,] %*% t(tTm1 %*% gmu[n_lat,])
+      }) %>% Reduce("+",.) / n_latent
+      
+      # diag(gT) <- diag(gT) * diag(TT) 
+      
+      gT[!(nonZeroElems == 1)] <- 0
+      
+      model_mean <- model_mean + rho_t_mu * deltamu
+      tTT <- t(TT) + rho_t_T * deltaT
+      
+      TT <- t(tTT)
+      
+      # diag(TT) <- exp(diag(TT))  
+    }
+    
+    # adadelta algo
+    if(T){
+      gmu <- deltaldeltabeta + t(TT %*% t(eps_beta))
+      
+      gT <- lapply(1:n_latent, function(n_lat){
+        - tTm1 %*% eps_beta[n_lat,] %*% t(tTm1 %*% gmu[n_lat,])
+      }) %>% Reduce("+",.) / n_latent
+      
+      # diag(gT) <- diag(gT) * diag(TT) 
+      
+      gT[!(nonZeroElems == 1)] <- 0
+      
+      gmu <- apply(gmu, 2, mean)
+      
+      # accumulate gradient
+      egmu <- rho * egmu + (1 - rho) * (gmu)^2
+      # compute change
+      deltamu <- gmu * sqrt(edeltamu + eps) / sqrt(egmu + eps)
+      # accumulate change
+      edeltamu <- rho * edeltamu + (1 - rho) * (deltamu)^2
+      
+      model_mean <- model_mean + eta_mu * deltamu
+      
+      # accumulate gradient
+      egT <- rho * egT + (1 - rho) * (gT)^2
+      # compute change
+      deltaT <- gT * sqrt(edeltaT + eps) / sqrt(egT + eps)
+      # accumulate change
+      edeltaT <- rho * edeltaT + (1 - rho) * (deltaT)^2
+      
+      tTT <- t(TT) + eta_T * deltaT
+      
+      TT <- t(tTT)
+      
+      # diag(TT) <- exp(diag(TT))  
+    }
+    
+   
+    # save output
+    {
+      model_mean_output[,i] <- model_mean
+      TT_output[,,i] <- TT
+      
+      Sigma_current <- solve(TT %*% t(TT))
+      
+      list_lossval <- computeELBO(y, M, sumM, occ, logit_psi, logit_p,
+                                  z_flipped, model_mean, Sigma_current)
+      # loss_values[i] <- maxGrad
+      loss_values1[i] <- list_lossval$loglik
+      loss_values2[i] <- - list_lossval$entropy
+      loss_values[i] <- loss_values1[i] + loss_values2[i]
+      
+      model_diag_output[,i] <- as.vector(diag(Sigma_current))
+      
+      if(verbose){
+        # print(paste0("Decrease Mean = ",max(paramDecrease_mean)))
+        # print(paste0("Decrease L = ",max(paramDecrease_cov)))
+        print(paste0("Loss = ",loss_values[i]))
+        # print(paste0("Average Sd = ",mean(diag(Sigma_current))))  
+      }
+      
+      if(i > 2){
+        
+        # Sigma_current <- L_current %*% t(L_current)
+        # Sigma_previous <- L_previous %*% t(L_previous)
+        # 
+        # diag_current <- diag(Sigma_current)
+        # diag_previous <- diag(Sigma_previous)
+        # 
+        # paramDecrease_mean <- abs( (model_mean_output[,i] - model_mean_output[,i-1]) / model_mean_output[,i-1]) 
+        # paramDecrease_cov <- abs( (diag_current - diag_previous) / diag_previous) 
+        # paramDecrease_cov <- paramDecrease_cov[!is.na(paramDecrease_cov)]
+        
+        # model_sigma_output[,i] <- as.vector(Sigma_current)
+        
+        
+      }  
+    }
+    
+  }
+  
+  list("model_mean" = model_mean,
+       "TT" = TT,
+       "model_mean_output" = model_mean_output,
+       "model_diag_output" = model_diag_output,
+       "TT_output" = TT_output,
+       "idx_covs_flipped" = idx_covs_flipped,
+       "idx_blocks_start" = idx_blocks_start,
+       "idx_blocks_end" = idx_blocks_end,
+       "loss_values1" = loss_values1,
+       "loss_values2" = loss_values2,
+       "loss_values" = loss_values)
+}
+
+
+simulateFromModelSparse <- function(model_mean, TT, 
+                              idx_covs_flipped, 
                               numSims = 1000){
   
-  if(useDiag){
-    L_mat <- createDiagMat(model_cov)
-  } else if(useSparse) {
-    L_mat <- createSparseMat(model_cov, idx_blocks_start, idx_blocks_end)
-  } else {
-    L_mat <- createCholMat(model_cov, numCov)
+  numCov <- length(model_mean)
+  
+  eps_beta <- matrix(rnorm(numSims * numCov), numSims, numCov)
+  
+  tTm1 <- t(solve(TT))
+
+  # create latent variables
+  {
+    
+    z_flipped <- sapply(1:numSims, function(l){
+      
+      model_mean + tTm1 %*% eps_beta[l,]
+      
+    })
+    
+    z <- z_flipped[idx_covs_flipped,,drop=F]
+    
+    # beta_psi_flipped <- z_flipped[1:ncov_psi,,drop=F]
+    # beta_p_flipped <- z_flipped[ncov_psi + 1:ncov_p,,drop=F]
+    # 
+    # beta_psi <- z[1:ncov_psi,,drop=F]
+    # beta_p <- z[ncov_psi + 1:ncov_p,,drop=F]
+    
+   
+    
   }
   
-  cov_mat <- L_mat %*% t(L_mat)
+  # if(useSparse){
+    # beta_samples <- beta_samples[,idx_covs_flipped]
+  # }
   
-  beta_samples <- mvrnorm(numSims, mu = model_mean, Sigma = cov_mat)
-  
-  if(useSparse){
-    beta_samples <- beta_samples[,idx_covs_flipped]
-  }
-  
-  beta_samples
+  t(z)
 }
 
 generateTrend <- function(beta_samples, df_time_occ){
@@ -174,7 +529,6 @@ generateTrend <- function(beta_samples, df_time_occ){
   b_t_qtl
   
 }
-
 
 plotCovariatesQtl <- function(beta_samples, idx_cov){
   

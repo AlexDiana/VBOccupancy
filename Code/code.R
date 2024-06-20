@@ -5,65 +5,71 @@ library(MASS)
 library(lubridate)
 library(here)
 library(splines)
+library(lubridate)
+library(reshape2)
 
 sourceCpp(here("Code","code.cpp"))
 source(here("Code","functions.R"))
 
 # CLEAN DATA -----
 
-data0 <- read.csv(here("Data","Ringlet_BNM_1970_2014_processed.csv"))
+load("~/VBOccupancy/Data/ringletdata.rda")
+load("~/VBOccupancy/Data/maxListLAreaRinglet.rda")
 
 # clean data
 
 {
-  data <- data0 %>%
+ 
+  data$maxListlArea <- maxListlArea
+  
+  data <- data %>%
     rename(Site = Gridref) %>% 
     mutate(SamplUnit = paste(Site, Year, sep = " - ")) %>% 
     arrange(Year, Site)
+  
+  data$relativeListLength <- data$listL / data$maxListlArea
+  
+  meanDataEast <- mean(data$EAST); sdDataEast <- sd(data$EAST)
+  meanDataNorth <- mean(data$NORTH); sdDataNorth <- sd(data$NORTH)
+  sdBoth <- (sdDataEast + sdDataNorth) / 2
+  data$EAST <- (data$EAST - meanDataEast) / sdBoth
+  data$NORTH <- (data$NORTH - meanDataNorth) / sdBoth
+  
+  data$relativeListLength <- (data$relativeListLength -
+                                mean(data$relativeListLength)) / sd(data$relativeListLength)
+  
+  
+  data_date <- as.Date(data$Date)
+  
+  data_jDate <- as.POSIXlt(data_date, format = "%d%b%y")
+  data$JulianDate <- data_jDate$yday
+  data$JulianDateSq <- (data_jDate$yday)^2
+  data$JulianDateCub <- (data_jDate$yday)^3
+  
+  
+  data$JulianDate <- scale(data$JulianDate)
+  data$JulianDateSq <- scale(data$JulianDateSq)
+  data$JulianDateCub <- scale(data$JulianDateCub)
   
   data_site <- data %>% 
     group_by(SamplUnit) %>% 
     filter(row_number() == 1) %>% 
     ungroup() 
   
-  # occupancy covariates
-  {
-    data_site$time <- factor(data_site$Year)
-    
-    t_basis <- model.matrix(~ time - 1, data = data_site)
-    
-    df_time_occ <- unique(as.data.frame(t_basis))
-    
-    rownames(df_time_occ) <- sort(unique(data$Year))
-    
-    X_psi <- cbind(1, t_basis)
-  }
+  data_site$time <- factor(data_site$Year)
+  # t_basis <- model.matrix(~ time - 1 , data = data_site)
+  t_basis <- model.matrix(~ time, data = data_site)
+  df_time_occ <- unique(as.data.frame(t_basis))
+  rownames(df_time_occ) <- sort(unique(data$Year))
+  Y <- length(unique(data$Year))
+  X_psi <- cbind(1, t_basis) %>% as.matrix
+  # X_psi <- t_basis %>% as.matrix
   
-  # detection covariates
-  {
-    data_week <- scale(data$Week)
-    spl_degree_p <- 3
-    
-    w_basis <- bs(data_week, 
-                  degree = spl_degree_p,
-                  intercept = F)
-    
-    colnames(w_basis) <- paste0("Wspline",1:ncol(w_basis))
-    
-    df_time_det <- 
-      bs(sort(unique(data_week)), 
-         degree = spl_degree_p,
-         Boundary.knots = attr(w_basis, "Boundary.knots"),
-         intercept = F) %>% 
-      as.matrix
-    
-    rownames(df_time_det) <- unique(data_week)
-    
-    X_p <- cbind(1, scale(data$listL), w_basis)
-    colnames(X_p)[1] <- "P intercept"
-    colnames(X_p)[2] <- "list length"  
-  }
+  X_p <- cbind(1, data[,c(12,13,14,15)]) %>% as.matrix
   
+}
+  
+{
   y <- data$Occ
   
   M <- data %>% 
@@ -95,219 +101,113 @@ data0 <- read.csv(here("Data","Ringlet_BNM_1970_2014_processed.csv"))
   
   ncov_psi <- ncol(X_psi)
   ncov_p <- ncol(X_p)
-  
-}
-
-# FIT MODEL ------
-
-useDiag <- F # set to true if using a diagonal covariance matrix
-useSparse <- F # set to true if using a full covariance matrix
-# otherwise, it will set a sparse matrix with blocks identified in the next
-# chunk of code
-
-# blocks
-{
-  # idx_covs <- 1:(ncov_psi + ncov_p)
-  idx_covs <- c(1,ncov_psi + 1,2:ncov_psi,ncov_psi + 2:ncov_p)
-  idx_covs_flipped <- order(idx_covs)
-  
-  idx_blocks_start <- c(1,3:length(idx_covs))
-  idx_blocks_end <- c(2,3:length(idx_covs))
-  # idx_blocks_start <- 1:length(idx_covs)
-  # idx_blocks_end <- 1:length(idx_covs)
-}
-
-# dim L
-{
   numCov <- ncov_psi + ncov_p
-  if(useDiag){
-    dimL <- numCov 
-  } else if(useSparse) {
-    dimL <- sum(
-      sapply(seq_along(idx_blocks_start), function(i) {
-        computeDimL(idx_blocks_end[i] - idx_blocks_start[i] + 1)    
-      })
-    )
-  } else {
-    dimL <- numCov * (numCov + 1) / 2
-  }  
-}
-
-n_latent <- 2
-
-# starting point 
-{
-  model_mean <- rep(0, numCov)
-  model_cov <- rep(0, dimL)
-}
-
-# adam
-{
-  eta <- .025
-  beta1 <- .9
-  beta2 <- .999
-  
-  
-  epsilon <- 1e-8
-  
-  v_tm1 <- rep(0, numCov + dimL)
-  m_tm1 <- rep(0, numCov + dimL)
-}
-
-epochs <- 1000
-loss_values <- rep(NA, epochs)
-model_mean_output <- matrix(NA, numCov, epochs)
-model_cov_output <- matrix(NA, dimL, epochs)
-model_sigma_output <- matrix(NA, numCov * numCov, epochs)
-model_diag_output <- matrix(NA, numCov, epochs)
-
-for (i in 1:epochs) {
-  
-  print(paste0("Epoch = ",i))
-  
-  {
-    eps_beta <- matrix(rnorm(n_latent / 2 * numCov), n_latent / 2, numCov)
-    eps_beta <- rbind(eps_beta, - eps_beta)
-  }
-  
-  if(useDiag){
-    L <- createDiagMat(model_cov)
-  } else if(useSparse) {
-    L <- createSparseMat(model_cov, idx_blocks_start, idx_blocks_end)
-  } else {
-    L <- createCholMat(model_cov, numCov)
-  }
-  
-  z_flipped <- sapply(1:n_latent, function(l){
-    
-    model_mean + L %*% eps_beta[l,]
-    
-  })
-  
-  z <- z_flipped[idx_covs_flipped,,drop=F]
-  
-  beta_psi_flipped <- z_flipped[1:ncov_psi,,drop=F]
-  beta_p_flipped <- z_flipped[ncov_psi + 1:ncov_p,,drop=F]
-  
-  beta_psi <- z[1:ncov_psi,,drop=F]
-  beta_p <- z[ncov_psi + 1:ncov_p,,drop=F]
-  
-  logit_psi <-  X_psi %*% beta_psi
-  logit_p <-  X_p %*% beta_p
-  
-  list_gradient <- computegrad(model_cov, y, M, eps_beta, sumM, occ, logit_psi, logit_p, 
-                               beta_psi, beta_p, X_psi, 
-                               X_p, idx_covs - 1, idx_blocks_start - 1, 
-                               idx_blocks_end - 1, n_latent, useDiag, useSparse)
-  deltaldeltamu <- list_gradient$deltaldelteamu
-  deltaldelteaL <- list_gradient$deltaldelteaL
-  deltaldelteabeta <- list_gradient$deltaldelteabeta
-  
-  deltaldeltamu <- apply(deltaldeltamu, 2, mean)
-  deltaldeltaL <- apply(deltaldelteaL, 2, mean)
-  
-  # prior
-  deltaldeltamu <- deltaldeltamu - model_mean
-  
-  # entropy 
-  diagElements <- extractDiagElement(numCov, idx_blocks_start, idx_blocks_end,
-                                     useSparse, useDiag)  
-  
-  deltaldeltaL[diagElements] <- deltaldeltaL[diagElements] +
-    derlogsoftplus(model_cov)[diagElements]
-  
-  # adam
-  {
-    g <- c(deltaldeltamu, deltaldeltaL)
-    m_t <- beta1 * m_tm1 + (1 - beta1) * g
-    v_t <- beta2 * v_tm1 + (1 - beta2) * g^2
-    
-    v_tm1 <- v_t
-    m_tm1 <- m_t
-    
-    model_mean <- model_mean + eta * (m_t / (sqrt(v_t) + epsilon))[1:numCov]
-    model_cov <- model_cov + eta * (m_t / (sqrt(v_t) + epsilon))[numCov + 1:dimL]
-    
-  }
-  
-  model_mean_output[,i] <- model_mean
-  model_cov_output[,i] <- model_cov
-  
-  maxGrad <- max(abs(c(deltaldeltamu, deltaldeltaL)))
-  loss_values[i] <- maxGrad
-  
-  if(i > 2){
-    
-    if(useDiag){
-      L_current <- createDiagMat(model_cov)
-      L_previous <- createDiagMat(model_cov_output[,i-1])
-      
-    } else if (useSparse) {
-      L_current <- createSparseMat(model_cov, idx_blocks_start, idx_blocks_end)
-      L_previous <- createSparseMat(model_cov_output[,i-1], idx_blocks_start, idx_blocks_end)
-      
-    } else {
-      L_current <- createCholMat(model_cov, numCov)
-      L_previous <- createCholMat(model_cov_output[,i-1], numCov)
-      
-    }
-    
-    Sigma_current <- L_current %*% t(L_current)
-    Sigma_previous <- L_previous %*% t(L_previous)
-    
-    diag_current <- diag(Sigma_current)
-    diag_previous <- diag(Sigma_previous)
-    
-    paramDecrease_mean <- abs( (model_mean_output[,i] - model_mean_output[,i-1]) / model_mean_output[,i-1]) 
-    paramDecrease_cov <- abs( (diag_current - diag_previous) / diag_previous) 
-    paramDecrease_cov <- paramDecrease_cov[!is.na(paramDecrease_cov)]
-    
-    model_sigma_output[,i] <- as.vector(Sigma_current)
-    model_diag_output[,i] <- as.vector(diag(Sigma_current))
-    
-    print(paste0("Decrease Mean = ",max(paramDecrease_mean)))
-    print(paste0("Decrease L = ",max(paramDecrease_cov)))
-    print(paste0("Average Sd = ",mean(diag(Sigma_current))))
-  }
   
 }
 
-# DIAGNOSTICS ----
+# FIT MODEL  ------
 
-subsetEpochs <- 50:epochs
-subsetCovs <- 1:(ncov_psi + ncov_p)
-
-model_mean_output[subsetCovs,subsetEpochs] %>% 
-  t %>% 
-  as.data.frame %>% 
-  # 'colnames<-' (1:(ncov_psi + ncov_p)) %>% 
-  'colnames<-' (subsetCovs) %>%
-  mutate(Epoch = subsetEpochs) %>% 
-  pivot_longer(!Epoch, names_to = "Covariate",
-               values_to = "Value") %>% 
-  ggplot(aes(x = Epoch,
-             y = Value,
-             color = Covariate)) + geom_line()
-
-subsetCovs <- 1:dimL
-model_sigma_output[subsetCovs,subsetEpochs] %>%
-  t %>%
-  as.data.frame %>%
-  # 'colnames<-' (1:dimL) %>%
-  'colnames<-' (subsetCovs) %>%
-  mutate(Epoch = subsetEpochs) %>%
-  pivot_longer(!Epoch, names_to = "Covariate",
-               values_to = "Value") %>%
-  ggplot(aes(x = Epoch,
-             y = Value,
-             color = Covariate)) + geom_line()
+epochs <- 10
+list_params <- fitModelSparse(y, M, sumM, occ, X_psi, X_p,
+                              useDiag = F, useSparse = F,
+                              epochs, n_latent = 2, verbose = T)
+model_mean <- list_params$model_mean
+TT <- list_params$TT
+idx_covs_flipped <- list_params$idx_covs_flipped
 
 # OUTPUT -----
 
-beta_samples <- simulateFromModel(model_mean, model_cov, useDiag, useSparse,
+beta_samples <- simulateFromModelSparse(model_mean, TT,
                                   idx_covs_flipped)
 
+beta_psi_output <- beta_samples[,1:ncol(X_psi)]
+beta_p_output <- beta_samples[,ncol(X_psi) + 1:ncol(X_p)]
+
+# year plot 
+
+{
+  
+  dataJulianDate <- data_jDate$yday
+  dataJulianDateSq <- (data_jDate$yday)^2
+  
+  data_jDate <- as.POSIXlt(data_date, format = "%d%b%y")
+  dataJulianDate <- data_jDate$yday
+  dataJulianDateSq <- (data_jDate$yday)^2
+  dataJulianDateCub <- (data_jDate$yday)^3
+  
+  mean_dataJulianDate <- mean(dataJulianDate)
+  sd_dataJulianDate <- sd(dataJulianDate)
+  mean_dataJulianDateSq <- mean(dataJulianDateSq)
+  sd_dataJulianDateSq <- sd(dataJulianDateSq)
+  mean_dataJulianDateCub <- mean(dataJulianDateCub)
+  sd_dataJulianDateCub <- sd(dataJulianDateCub)
+  year <- 2000
+  # year0 <- 1970
+  
+  niterations <- nrow(beta_p_output)
+  x <- 1:365
+  captureProbWide <- t(sapply(1:niterations, function(i){
+    
+    b <- beta_p_output[i,c(1,3,4,5)]
+    
+    b_tilde <- c(b[1] - 
+                   b[2] * mean_dataJulianDate / sd_dataJulianDate -
+                   b[3] * mean_dataJulianDateSq / sd_dataJulianDateSq -
+                   b[4] * mean_dataJulianDateCub / sd_dataJulianDateCub ,
+                 b[2] / sd_dataJulianDate,
+                 b[3] / sd_dataJulianDateSq,
+                 b[4] / sd_dataJulianDateCub)
+    
+    logistic(b_tilde[1] + b_tilde[2] * x + b_tilde[3] * x * x + b_tilde[4] * x * x * x)
+  }))
+  
+  captureProbLong <- melt(captureProbWide)
+  captureProbMean <- apply(captureProbWide, 2, function(x){
+    quantile(x, probs = c(0.025,0.5,0.975))
+  })
+  
+  idxdatesOnAxis <- c(91, 121, 152, 182, 213, 244)
+  datesOnAxis <- as.Date(idxdatesOnAxis, origin=as.Date(paste0(year,"-01-01")))
+  
+  x_grid <- 1:365
+  
+  (jdateplot <- ggplot() + 
+      # geom_line(data = captureProbLong, aes(x = Var2, y = value,
+      #                                       group = Var1), alpha = .0075) +
+      geom_ribbon(data = NULL, 
+                  aes(x = 1:365, 
+                      ymin=captureProbMean[1,],
+                      ymax=captureProbMean[3,]), fill="grey", alpha=0.9) +
+      geom_line(data = NULL, aes(x = 1:365, y = captureProbMean[2,]), color = "black") + 
+      scale_x_continuous(
+        name = "Date",
+        breaks = x_grid[idxdatesOnAxis],
+        labels = format(datesOnAxis, "%d-%B")) + 
+      scale_y_continuous(name = "Detection Probability"
+                         # breaks = c(0, 1e-11, 1e-8, 1e-6,  1e-4, 1e-3, 0.01, 0.1, 0.4)
+                         # labels = c(0, )
+      ) +
+      # coord_trans(y = "newscale") + 
+      # coord_cartesian(xlim = c(130, 247), 
+      coord_cartesian(xlim = c(110, 260),
+                      ylim = c(0, 0.35)) +
+      # ylim = c(0, 0.32)) +
+      ggplot2::theme(
+        plot.title = ggplot2::element_text(hjust = 0.5, size = 20),
+        axis.title = ggplot2::element_text(size = 20, face = "bold"),
+        axis.text = ggplot2::element_text(size = 11, face = "bold", angle = 0),
+        panel.grid.major = ggplot2::element_line(colour = "grey", size = 0.15),
+        panel.background = ggplot2::element_rect(fill = "white", color = "black")
+      ) )
+  
+  # ggsave(paste0("jdate_plot",year,".png"), jdateplot,
+         # width = 8, height = 5)
+  
+  
+}
+
 # yearly occupancy probabilities
+
 {
   b_t_qtl <- generateTrend(beta_samples, df_time_occ)
   
@@ -327,41 +227,5 @@ beta_samples <- simulateFromModel(model_mean, model_cov, useDiag, useSparse,
             axis.title = element_text(size = 15)))
   
 }
-
-# detection probability pattern
-
-{
-  b_t_qtl <- generateTrend_det(beta_samples, df_time_det, year = 2000)
-  
-  week0 <- as.Date("01/01/2000", format = "%d/%m/%Y")
-  
-  idxWeeks <- 5 * 0:10
-  labelWeeks <- week0 + days(7 * idxWeeks)
-  labelWeeks <- format(labelWeeks, "%Y-%d-%b")
-  labelWeeks <- gsub(pattern = "2000-", replacement = "", as.character(labelWeeks))
-  
-  plot_dettrend <- ggplot(data = NULL, aes(x = 1:53,
-                                           ymin = b_t_qtl[1,],
-                                           ymax = b_t_qtl[2,],
-                                           y = b_t_qtl[3,])) + 
-    geom_errorbar(size = .7) + 
-    geom_point() + 
-    ylim(c(0,.2)) +
-    theme_bw() + 
-    scale_x_continuous(breaks = idxWeeks + 1, 
-                       labels = labelWeeks,
-                       name = "Day",
-                       limits = c(3,53)) + 
-    ylab("Detection probability") + 
-    theme(axis.text = element_text(angle = 90, size = 12),
-          axis.title = element_text(size = 15))
-  
-}
-
-# DETECTION COVARIATES ------
-
-idx_cov <- which(covNames == "list length")
-
-plotCovariatesQtl(beta_samples, idx_cov)
 
 
